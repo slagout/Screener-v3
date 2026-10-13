@@ -17,6 +17,7 @@ import html
 import os
 import sys
 import urllib.parse
+import checklist
 from datetime import datetime, timedelta
 from collections import Counter
     # 3. Deep screen sequentially (20-100% of the bar)
@@ -1018,6 +1019,54 @@ def build_pdf(rows):
     return bytes(pdf.output())
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _checklist_fields(ticker, q_items):
+    stock = yf.Ticker(ticker, session=get_yfinance_session())
+    info = fetch_with_retry(lambda: stock.info) or {}
+    return checklist.build_fields(stock, info, dict(q_items))
+
+
+def render_checklist(q):
+    tkr = q.get("ticker", "")
+    st.caption(f"{q.get('company_name', tkr)} · {tkr}. Pre-filled from screener and Yahoo Finance data; edit anything before downloading.")
+    with st.spinner("Pulling company data..."):
+        fields = _checklist_fields(tkr, tuple(sorted((k, v) for k, v in q.items() if not isinstance(v, (list, dict)))))
+    if not fields:
+        st.warning("No data could be pulled for this company.")
+        return
+    sections = {}
+    for cell, (val, src, label, sec) in fields.items():
+        sections.setdefault(sec, []).append((cell, val, src, label))
+    edited = {}
+    for sec, rows in sections.items():
+        with st.expander(f"{sec} ({len(rows)} filled)", expanded=sec in ("Header", "Section 3", "Section 4")):
+            for cell, val, src, label in rows:
+                key = f"ck_{tkr}_{cell}"
+                if isinstance(val, str) and len(val) > 60:
+                    new = st.text_area(label, value=val, key=key, help=f"Source: {src}")
+                else:
+                    new = st.text_input(label, value=str(val), key=key, help=f"Source: {src}")
+                if isinstance(val, (int, float)):
+                    try:
+                        new = float(new)
+                    except ValueError:
+                        pass
+                edited[cell] = new
+    st.caption("Judgement items (moat, management feel, risks, valuation calls, final list) are left blank for you.")
+    st.download_button(
+        "Download filled checklist (.xlsx)",
+        data=checklist.build_xlsx(edited),
+        file_name=f"CAGR_Research_Checklist_{tkr}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"ck_dl_{tkr}",
+        use_container_width=True,
+    )
+
+
+def open_checklist(q):
+    st.dialog(f"Research checklist: {q.get('ticker', '')}", width="large")(lambda: render_checklist(q))()
+
+
 def render_results(all_qualified, all_failed):
         st.markdown("---")
         st.markdown("## Results: " + str(len(all_qualified)) + " qualified")
@@ -1063,6 +1112,8 @@ def render_results(all_qualified, all_failed):
                     f"<div class='driver'>{html.escape(q.get('driver',''))}</div></div>",
                     unsafe_allow_html=True,
                 )
+                if st.button("Research checklist", key=f"ck_btn_{idx}_{tkr}"):
+                    open_checklist(q)
 
             # ── CSV download ──
             csv_lines = []
