@@ -271,7 +271,7 @@ def tier_name_filter(tickers):
 def deep_screen(ticker, price, iv_min, iv_max, min_vol):
     result = {
         "ticker": ticker, "qualified": False, "status": "rejected", "fail_reason": "",
-        "company_name": "", "sector": "", "industry": "",
+        "company_name": "", "sector": "", "industry": "", "exchange": "",
         "price": price, "iv": None, "volume": 0,
         "avg_volume": 0, "margin": None, "cagr": None,
         "driver": "", "options_liquid": False,
@@ -296,6 +296,7 @@ def deep_screen(ticker, price, iv_min, iv_max, min_vol):
         result["company_name"] = info.get("longName") or info.get("shortName") or ticker
         result["sector"] = info.get("sector") or "N/A"
         result["industry"] = info.get("industry") or "N/A"
+        result["exchange"] = info.get("fullExchangeName") or info.get("exchange") or ""
 
         # Industry/sector/name filter
         if not industry_pass(info):
@@ -1018,6 +1019,77 @@ def build_pdf(rows):
     return bytes(pdf.output())
 
 
+def simply_wall_st_url(ticker, company_name, sector, industry, exchange):
+    search_url = f"https://simplywall.st/search?{urllib.parse.urlencode({'q': ticker})}"
+    exchange_aliases = {
+        "nasdaq": "nasdaq", "nasdaqgs": "nasdaq", "nasdaqgm": "nasdaq", "nasdaqcm": "nasdaq",
+        "nms": "nasdaq", "ngm": "nasdaq", "ncm": "nasdaq",
+        "nyse": "nyse", "nyq": "nyse",
+        "nysearca": "nysearca", "arca": "nysearca", "pcx": "nysearca",
+        "nyseamerican": "nyseamerican", "amex": "nyseamerican", "ase": "nyseamerican",
+        "bats": "bats", "bts": "bats",
+    }
+    exchange_key = re.sub(r"[^a-z]", "", (exchange or "").lower())
+    exchange_slug = exchange_aliases.get(exchange_key)
+    if not exchange_slug:
+        return search_url
+
+    industry_key = (industry or "").lower()
+    sector_key = (sector or "").lower()
+    category = None
+    if sector_key == "energy" or re.search(r"oil|gas|coal|uranium", industry_key):
+        category = "energy"
+    elif re.search(r"software", industry_key):
+        category = "software"
+    elif re.search(r"semiconductor|consumer electronics|computer hardware|communication equipment", industry_key):
+        category = "tech"
+    elif re.search(r"biotechnology", industry_key):
+        category = "biotechnology"
+    elif re.search(r"pharmaceutical|drug manufacturer", industry_key):
+        category = "pharmaceuticals"
+    elif re.search(r"medical device|medical equipment|medical instrument", industry_key):
+        category = "medical-equipment"
+    elif re.search(r"healthcare provider|healthcare plan|medical care facilit", industry_key):
+        category = "healthcare-services"
+    elif "bank" in industry_key:
+        category = "banks"
+    elif "insurance" in industry_key:
+        category = "insurance"
+    elif "reit" in industry_key or sector_key == "real estate":
+        category = "real-estate"
+    elif re.search(r"retail|department store", industry_key):
+        category = "retail"
+    elif re.search(r"restaurant|hotel|travel|leisure", industry_key):
+        category = "consumer-services"
+    elif sector_key == "utilities":
+        category = "utilities"
+    elif sector_key == "basic materials":
+        category = "materials"
+    elif sector_key == "financial services":
+        category = "diversified-financials"
+    elif sector_key == "technology":
+        category = "tech"
+    if not category:
+        return search_url
+
+    company_slug = re.sub(
+        r"\b(?:incorporated|corporation|corp|inc|company|co|limited|ltd|plc|llc)\b",
+        "",
+        (company_name or "").lower(),
+    )
+    company_slug = re.sub(r"[^a-z0-9]+", "-", company_slug).strip("-")
+    if not company_slug:
+        return search_url
+
+    ticker_slug = urllib.parse.quote(ticker.lower(), safe="-")
+    return f"https://simplywall.st/stocks/us/{category}/{exchange_slug}-{ticker_slug}/{company_slug}"
+
+
+def stockanalysis_url(ticker):
+    slug = urllib.parse.quote((ticker or "").lower().replace(".", "-"), safe="-")
+    return f"https://stockanalysis.com/stocks/{slug}/"
+
+
 def render_results(all_qualified, all_failed):
         st.markdown("---")
         st.markdown("## Results: " + str(len(all_qualified)) + " qualified")
@@ -1041,7 +1113,11 @@ def render_results(all_qualified, all_failed):
                 tkr_esc = html.escape(tkr)
                 tkr_param = urllib.parse.quote(tkr)
                 ss_url = f"https://app.stocksimplifier.com/simplify?ticker={tkr_param}"
-                sw_url = f"https://simplywall.st/search?{urllib.parse.urlencode({'q': tkr})}"
+                sw_url = simply_wall_st_url(
+                    tkr, q.get("company_name", ""), q.get("sector", ""),
+                    q.get("industry", ""), q.get("exchange", ""),
+                )
+                sa_url = stockanalysis_url(tkr)
                 ext_icon = ("<svg viewBox='0 0 24 24'><path d='M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6'/>"
                             "<polyline points='15 3 21 3 21 9'/><line x1='10' y1='14' x2='21' y2='3'/></svg>")
 
@@ -1053,7 +1129,8 @@ def render_results(all_qualified, all_failed):
                     f"<div class='card-links'>"
                     f"<a class='ext-link' href='{ss_url}' target='_blank' rel='noopener noreferrer'>{ext_icon} Stock Simplifier</a>"
                     f"<a class='ext-link' href='{sw_url}' target='_blank' rel='noopener noreferrer'>{ext_icon} Simply Wall St</a>"
-                    f"</div></div>"
+                                        f"<a class='ext-link' href='{sa_url}' target='_blank' rel='noopener noreferrer'>{ext_icon} StockAnalysis</a>"
+                                        f"</div></div>"
                     f"<div class='card-price'>${q['price']:.2f}</div></div>"
                     f"<div class='metrics'>"
                     f"<div class='metric'><span>IV</span><b>{q['iv']:.1f}%</b></div>"
@@ -1066,11 +1143,14 @@ def render_results(all_qualified, all_failed):
 
             # ── CSV download ──
             csv_lines = []
-            csv_lines.append("ticker,company_name,price,iv,avg_volume,margin,cagr,sector,industry,tier,options_liquid,driver,stock_simplifier_url,simply_wall_st_url")
+            csv_lines.append("ticker,company_name,price,iv,avg_volume,margin,cagr,sector,industry,tier,options_liquid,driver,stock_simplifier_url,simply_wall_st_url,stockanalysis_url")
             for q in all_qualified:
                 t_val = q.get("ticker", "")
                 ss_lnk = f"https://app.stocksimplifier.com/simplify?ticker={urllib.parse.quote(t_val)}"
-                sw_lnk = f"https://simplywall.st/search?{urllib.parse.urlencode({'q': t_val})}"
+                sw_lnk = simply_wall_st_url(
+                    t_val, q.get("company_name", ""), q.get("sector", ""),
+                    q.get("industry", ""), q.get("exchange", ""),
+                )
                 row = (
                     t_val,
                     q.get("company_name","").replace(","," "),
@@ -1086,6 +1166,7 @@ def render_results(all_qualified, all_failed):
                     q.get("driver","").replace(","," "),
                     ss_lnk,
                     sw_lnk,
+                    stockanalysis_url(t_val),
                 )
                 csv_lines.append(",".join(str(v) for v in row))
             csv_data = "\n".join(csv_lines)
