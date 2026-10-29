@@ -47,7 +47,14 @@ SCREEN_CACHE_TTL = 3600
 FAILED_TICKERS = []
 MISSING_PRICES = []
 
+# Free APIs (Yahoo Finance, Nasdaq screener) enforce rate limits. When throttling
+# is detected, the suggested cooldown escalates with each consecutive rate-limited run.
+API_RATE_LIMIT_WAIT_STEPS_MIN = [5, 15, 30]
+# Small delay between Yahoo calls inside deep_screen to avoid tripping the limiter.
+YAHOO_REQUEST_DELAY_S = 0.4
+
 _YF_SESSION = None
+_LAST_YF_ERROR = None
 
 
 def get_yfinance_session():
@@ -79,7 +86,7 @@ def get_yfinance_session():
 
 
 def fetch_with_retry(fn, max_retries=3, base_delay=1.0):
-    global _YF_SESSION
+    global _YF_SESSION, _LAST_YF_ERROR
     for attempt in range(max_retries):
         try:
             result = fn()
@@ -89,11 +96,54 @@ def fetch_with_retry(fn, max_retries=3, base_delay=1.0):
                 _YF_SESSION = None  # Reset session to refresh crumb on 401
                 raise ValueError("401 Unauthorized — crumb expired")
             return result
-        except Exception:
+        except Exception as e:
+            _LAST_YF_ERROR = e
             if attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt)
                 time.sleep(delay)
     return None
+
+
+def is_rate_limit_error(err):
+    """Detect rate-limit/throttling signatures in an error message or exception."""
+    s = str(err or "").lower()
+    return any(k in s for k in (
+        "429", "too many requests", "rate limit", "ratelimit", "throttl",
+        "401", "unauthorized", "403", "forbidden",
+    ))
+
+
+def current_rate_limit_wait_min():
+    """Escalating cooldown: 5 min, then 15, then 30 for consecutive rate-limited runs."""
+    strikes = st.session_state.get("rate_limit_strikes", 0)
+    return API_RATE_LIMIT_WAIT_STEPS_MIN[min(strikes, len(API_RATE_LIMIT_WAIT_STEPS_MIN) - 1)]
+
+
+def show_api_limit_message(source="Yahoo Finance", err=None):
+    """Render a clear failure message with an escalating wait time for free, rate-limited APIs."""
+    wait_min = current_rate_limit_wait_min()
+    retry_at = (datetime.now() + timedelta(minutes=wait_min)).strftime("%I:%M %p").lstrip("0")
+    if err is None or is_rate_limit_error(err):
+        st.session_state["rate_limit_strikes"] = st.session_state.get("rate_limit_strikes", 0) + 1
+        next_wait = current_rate_limit_wait_min()
+        st.error(
+            f"❌ {source} API limit reached. {source} is a free API and temporarily "
+            "blocks requests when too many calls are made in a short period."
+        )
+        msg = (
+            f"💡 Please wait at least **{wait_min} minutes** before retrying "
+            f"(earliest retry ≈ {retry_at}). Previously cached results will load instantly on the next run."
+        )
+        if next_wait > wait_min:
+            msg += (f" If you retry too soon and get limited again, the recommended wait "
+                    f"increases to **{next_wait} minutes**.")
+        st.info(msg)
+    else:
+        st.error(f"❌ {source} connection error: {err}")
+        st.info(
+            f"💡 Check your internet connection and retry. If it keeps failing, wait "
+            f"**{wait_min} minutes** in case {source} is rate-limiting requests (free API)."
+        )
 
 
 def test_yahoo_connectivity():
@@ -103,12 +153,12 @@ def test_yahoo_connectivity():
         test = yf.Ticker("AAPL", session=sess)
         info = fetch_with_retry(lambda: test.info, max_retries=2, base_delay=1.0)
         if not info or not info.get("symbol"):
-            st.error("❌ Yahoo Finance connection failed or is rate-limiting requests.")
-            st.info("💡 Please wait a few minutes before retrying.")
+            show_api_limit_message("Yahoo Finance", _LAST_YF_ERROR)
             return False
+        st.session_state["rate_limit_strikes"] = 0  # healthy connection resets the escalation
         return True
     except Exception as e:
-        st.error(f"❌ Yahoo Finance connectivity error: {e}")
+        show_api_limit_message("Yahoo Finance", e)
         return False
 
 
@@ -279,6 +329,7 @@ def deep_screen(ticker, price, iv_min, iv_max, min_vol):
     try:
         sess = get_yfinance_session()
         stock = yf.Ticker(ticker, session=sess)
+        time.sleep(YAHOO_REQUEST_DELAY_S)  # pace Yahoo calls to stay under the free-API limit
         info = fetch_with_retry(lambda: stock.info)
         if info is None:
             if ticker not in FAILED_TICKERS:
@@ -341,6 +392,7 @@ def deep_screen(ticker, price, iv_min, iv_max, min_vol):
 
         weeks_with_volume = 0
         for exp in exp_dates[:10]:
+            time.sleep(YAHOO_REQUEST_DELAY_S)
             try:
                 chain = stock.option_chain(exp)
                 if (chain.calls["volume"].sum() + chain.puts["volume"].sum()) > 0:
@@ -402,6 +454,7 @@ def deep_screen(ticker, price, iv_min, iv_max, min_vol):
         # Fallback to yfinance IV
         if not iv_found:
             for exp in exp_dates[:5]:
+                time.sleep(YAHOO_REQUEST_DELAY_S)
                 try:
                     chain = stock.option_chain(exp)
                     if not chain.calls.empty:
@@ -579,7 +632,8 @@ def render_wiki():
         st.markdown(
             "Each card shows price, IV, average volume, margin, revenue CAGR, sector and a short business summary.\n\n"
             "The **Failure Summary** lists why stocks were dropped. If it shows Yahoo Finance errors or empty "
-            "option expirations, Yahoo is throttling requests; wait a few minutes and run again."
+            "option expirations, Yahoo is throttling requests; wait at least 5 minutes and run again "
+            "(the suggested wait grows to 15, then 30 minutes if you retry too soon)."
         )
     with t4:
         for tip in LOADER_TIPS + WIKI_EXTRA_TIPS:
@@ -1192,9 +1246,23 @@ def render_results(all_qualified, all_failed):
             st.warning("No qualified companies found.")
 
         with st.expander(f"📊 Failure Summary ({len(all_failed)} total)"):
-            st.markdown(f"**Fetch errors: {sum(r.get('status') == 'fetch_error' for r in all_failed)}**")
+            fetch_errs = [r for r in all_failed if r.get("status") == "fetch_error"]
+            st.markdown(f"**Fetch errors: {len(fetch_errs)}**")
             st.markdown(f"**Filter rejections: {sum(r.get('status', 'rejected') == 'rejected' for r in all_failed)}**")
             st.markdown(f"**Missing batch prices: {len(missing_prices)}**")
+            throttled = [
+                r for r in all_failed
+                if is_rate_limit_error(r.get("fail_reason")) or "Yahoo" in (r.get("fail_reason") or "")
+            ]
+            if throttled:
+                wait_min = current_rate_limit_wait_min()
+                retry_at = (datetime.now() + timedelta(minutes=wait_min)).strftime("%I:%M %p").lstrip("0")
+                st.warning(
+                    f"⏳ {len(throttled)} stocks failed because Yahoo Finance is rate-limiting requests "
+                    f"(free API). Wait at least **{wait_min} minutes** "
+                    f"(retry after ≈ {retry_at}) and run again — these failures are not cached, "
+                    "so the stocks will be retried automatically."
+                )
             for status, label in (("fetch_error", "Fetch errors"), ("rejected", "Filter rejections")):
                 status_rows = [r for r in all_failed if r.get("status", "rejected") == status]
                 if status_rows:
